@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <numeric>
 #include <chrono>
+#include <random>
 
 
 //eval_grad definition : 
@@ -15,6 +16,7 @@
 // parent_grad is the gradient of the parent node evaluated at g(x1,x2,...)
 // eval_grad should compute the partial differential of f(g) with respect to x_i, where x_i is an input of the current node, and pass it to the child node i
 
+static constexpr bool PRINT_LOSS = true;
 
 constexpr size_t next_power_of_two(size_t v)
 {
@@ -30,7 +32,7 @@ constexpr size_t next_power_of_two(size_t v)
 
 
 //Could be improved by using shared memory and improving memory coalescing, or just by using cuBLAS
-__global__ void mat_mul(const float* a, const float* b, float* c, int n, int mid, int m)
+__global__ void mat_mul(const float* a, const float* b, float* result, int n, int mid, int m)
 {
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -40,11 +42,12 @@ __global__ void mat_mul(const float* a, const float* b, float* c, int n, int mid
         float sum = 0;
         for (int k = 0; k < mid; k++)
             sum += a[k + i * mid] * b[j + k * m];
-        c[j + i * m] = sum;
+        result[j + i * m] = sum;
     }
 }
 
-__global__ void mat_mul_grad_left(const float* parent_grad, const float* op2_data, float* op1_grad, int n, int m, int cols)
+// parent_grad * op2_data^T
+__global__ void mat_mul_grad_left(const float* parent_grad, const float* op2_data, float* left_grad_out, int n, int m, int cols)
 {
     int i_row = blockIdx.y * blockDim.y + threadIdx.y;
     int i_col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -55,10 +58,11 @@ __global__ void mat_mul_grad_left(const float* parent_grad, const float* op2_dat
         {
             sum += parent_grad[c + i_row * cols] * op2_data[c + i_col * cols];
         }
-        op1_grad[i_col + m * i_row] = sum;
+        left_grad_out[i_col + m * i_row] += sum;
     }
 }
 
+// op1_data^T * parent_grad
 __global__ void mat_mul_grad_right(const float* parent_grad, const float* op1_data, float* op2_grad, int n, int m, int rows)
 {
     int i_row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -68,31 +72,31 @@ __global__ void mat_mul_grad_right(const float* parent_grad, const float* op1_da
         float sum = 0;
         for (int r = 0; r < rows; r++)
             sum += parent_grad[i_col + r * m] * op1_data[i_row + r * n];
-        op2_grad[i_col + m * i_row] = sum;
+        op2_grad[i_col + m * i_row] += sum;
     }
 }
 
-__global__ void mat_sum(const float* a, const float* b, float* c, int n, int m)
+__global__ void mat_sum(const float* a, const float* b, float* result, int n, int m)
 {
     int i_row = blockIdx.y * blockDim.y + threadIdx.y;
     int i_col = blockIdx.x * blockDim.x + threadIdx.x;
     if (i_row < n && i_col < m)
     {
-        c[i_col + m * i_row] = a[i_col + m * i_row] + b[i_col + m * i_row];
+        result[i_col + m * i_row] = a[i_col + m * i_row] + b[i_col + m * i_row];
     }
 }
 
-__global__ void mat_sum_all_cols(const float* a, const float* b, float* c, int n, int m)
+__global__ void mat_sum_all_cols(const float* a, const float* b, float* result, int n, int m)
 {
     int i_row = blockIdx.y * blockDim.y + threadIdx.y;
     int i_col = blockIdx.x * blockDim.x + threadIdx.x;
     if (i_row < n && i_col < m)
     {
-        c[i_col + m * i_row] = a[i_col + m * i_row] + b[i_row];
+        result[i_col + m * i_row] = a[i_col + m * i_row] + b[i_row];
     }
 }
 
-__global__ void mat_sum_all_cols_grad(const float* parent_grad, float* a, int n, int m)
+__global__ void mat_sum_all_cols_grad(const float* parent_grad, float* output_grad, int n, int m)
 {
 	int i_row = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i_row < n)
@@ -100,60 +104,70 @@ __global__ void mat_sum_all_cols_grad(const float* parent_grad, float* a, int n,
 		float sum = 0;
 		for (int i = 0; i < m; i++)
 			sum += parent_grad[i + m * i_row];
-		a[i_row] = sum;
+		output_grad[i_row] += sum;
 	}
 }
 
-__global__ void mat_grad_desc(const float* grad, float* val, float alpha, int n, int m)
+__global__ void mat_grad_desc(const float* grad, float* parameters, float alpha, int n, int m)
 {
     int i_row = blockIdx.y * blockDim.y + threadIdx.y;
     int i_col = blockIdx.x * blockDim.x + threadIdx.x;
     if (i_row < n && i_col < m)
     {
-        val[i_col + m * i_row] -= alpha * grad[i_col + m * i_row];
+        parameters[i_col + m * i_row] -= alpha * grad[i_col + m * i_row];
     }
 }
 
-__global__ void elementwise_square_plus_one_stride(const float* o, float* a, uint32_t stride , uint32_t n)
+__global__ void elementwise_square_plus_one_stride(const float* input, float* output, uint32_t stride , uint32_t n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < stride && i + stride < n)
-        a[i] = 0.5f * (o[i] * o[i] + o[i + stride] * o[i + stride]);
+        output[i] = 0.5f * (input[i] * input[i] + input[i + stride] * input[i + stride]);
     else if (i < stride && i < n)
-        a[i] = 0.5f * (o[i] * o[i]);
+        output[i] = 0.5f * (input[i] * input[i]);
 
 }
 
-__global__ void elementwise_tanh(const float* o, float* a, uint32_t n)
+__global__ void l2_grad(const float* parent_grad, float* child_value, float* out, int n, int m)
+{
+    int i_row = blockIdx.y * blockDim.y + threadIdx.y;
+    int i_col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i_row < n && i_col < n)
+	{
+		out[i_col + n * i_row] += parent_grad[0] * child_value[i_col + m * i_row];
+	}
+}
+
+__global__ void elementwise_tanh(const float* input, float* result, uint32_t n)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i < n)
-		a[i] = tanhf(o[i]);
+		result[i] = tanhf(input[i]);
 }
 
 //f' = 1 - f^2
-__global__ void tanh_grad(const float* parent_grad, const float* o, float* a, uint32_t n)
+__global__ void tanh_grad(const float* parent_grad, const float* tanh_x, float* result, uint32_t n)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i < n)
-        a[i] = parent_grad[i] * (1.0f - o[i] * o[i]);   
+        result[i] += parent_grad[i] * (1.0f - tanh_x[i] * tanh_x[i]);   
 }
 
-__global__ void reduce(float* a, uint32_t stride, uint32_t n)
+__global__ void reduce(float* result, uint32_t stride, uint32_t n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < stride && i + stride < n)
     {
-        a[i] += a[i + stride];
+        result[i] += result[i + stride];
     }
 }
 
-__global__ void direct_square_reduce(const float* o, float* a, uint32_t n)
+__global__ void direct_square_reduce(const float* input, float* result, uint32_t n)
 {
-    a[0] = 0;
+    result[0] = 0;
     for (int i = 0; i < n; i++)
     {
-        a[0] += 0.5f * o[i] * o[i];
+        result[0] += 0.5f * input[i] * input[i];
     }
 }
 
@@ -168,6 +182,7 @@ struct matrix_tanh
     {
         cudaMalloc(&gpu_data, OP::rows * OP::cols * sizeof(float));
         cudaMalloc(&grad_data, OP::rows * OP::cols * sizeof(float));
+        op.num_parents++;
     }
     ~matrix_tanh()
     {
@@ -181,7 +196,15 @@ struct matrix_tanh
         size_t size = OP::rows * OP::cols;
         constexpr int threads_per_block = 64;
         int num_blocks = 1 > size / threads_per_block ? 1 : size / threads_per_block;
-        elementwise_tanh << < dim3(num_blocks, 1, 1), dim3(num_blocks, 1, 1) >> > (op.gpu_data, gpu_data, size);
+        elementwise_tanh << < dim3(num_blocks, 1, 1), dim3(threads_per_block, 1, 1) >> > (op.gpu_data, gpu_data, size);
+
+    }
+
+    void zero_grad()
+    {
+		proccessed_parents = 0;
+		cudaMemset(grad_data, 0, OP::rows * OP::cols * sizeof(float));
+		op.zero_grad();
     }
 
     void eval_grad(float* parent_grad)
@@ -189,11 +212,13 @@ struct matrix_tanh
         size_t size = OP::rows * OP::cols;
         constexpr int threads_per_block = 64;
         int num_blocks = 1 > size / threads_per_block ? 1 : size / threads_per_block;
-        tanh_grad << < dim3(1, 1, 1), dim3(OP::rows, OP::cols, 1) >> > (parent_grad, op.gpu_data, grad_data, size);
-        op.eval_grad(grad_data);
+        tanh_grad << < dim3(num_blocks, 1, 1), dim3(threads_per_block, 1, 1) >> > (parent_grad, gpu_data, grad_data, size);
+        if (++proccessed_parents == num_parents)
+            op.eval_grad(grad_data);
     }
 
-
+    size_t num_parents = 0;
+    size_t proccessed_parents = 0;
     OP& op;
     float* gpu_data;
     float* grad_data;
@@ -209,10 +234,13 @@ struct matrix_l2
     matrix_l2(OP& o) : op(o)
     {
         cudaMalloc(&gpu_data, OP::rows * OP::cols * sizeof(float));
+        cudaMalloc(&grad_data, OP::rows * OP::cols * sizeof(float));
+        op.num_parents++;
     }
     ~matrix_l2()
     {
         cudaFree(&gpu_data);
+        cudaFree(&grad_data);
     }
 
     void eval()
@@ -235,9 +263,19 @@ struct matrix_l2
                 reduce << < num_blocks, threads_per_block >> > (gpu_data, stride, size);
             }
         }
-        float x;
-        cudaMemcpy(&x, gpu_data, sizeof(float), cudaMemcpyDeviceToHost);
-        std::cout << "Error : " << x << '\n';
+        if constexpr (PRINT_LOSS)
+        {
+            float x;
+            cudaMemcpy(&x, gpu_data, sizeof(float), cudaMemcpyDeviceToHost);
+            std::cout << "Error : " << x << '\n';
+        }
+    }
+
+    void zero_grad()
+    {
+        proccessed_parents = 0;
+        cudaMemset(grad_data, 0, OP::rows * OP::cols * sizeof(float));
+        op.zero_grad();
     }
 
     void eval_grad()
@@ -245,9 +283,20 @@ struct matrix_l2
         op.eval_grad(op.gpu_data);
     }
 
+    void eval_grad(float* parent_grad)
+	{
+        int blocks_x = cols > 16 ? cols / 16 : 1;
+        int blocks_y = rows > 16 ? cols / 16 : 1;
+        l2_grad << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (parent_grad, op.gpu_data, grad_data, rows, cols);
+        if (++proccessed_parents == num_parents)
+			op.eval_grad(grad_data);
+	}
 
+    size_t num_parents = 0;
+    size_t proccessed_parents = 0;
     OP& op;
     float* gpu_data;
+    float* grad_data;
 };
 
 //Matrix product
@@ -263,6 +312,8 @@ public:
         cudaMalloc(&gpu_data, rows * cols * sizeof(float));
         cudaMalloc(&op1_grad, OP1::rows * OP1::cols * sizeof(float));
         cudaMalloc(&op2_grad, OP2::rows * OP2::cols * sizeof(float));
+        op1.num_parents++;
+        op2.num_parents++;
     }
     ~matrix_product()
     {
@@ -280,19 +331,34 @@ public:
         mat_mul << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (op1.gpu_data, op2.gpu_data, gpu_data, rows, OP1::cols, cols);
     }
 
+    void zero_grad()
+    {
+        proccessed_parents = 0;
+        cudaMemset(op1_grad, 0, OP1::rows * OP1::cols * sizeof(float));
+        cudaMemset(op2_grad, 0, OP2::rows * OP2::cols * sizeof(float));
+        op1.zero_grad();
+        op2.zero_grad();
+    }
+
     void eval_grad(float* parent_grad)
     {
         int blocks_x = OP1::cols > 16 ? OP1::cols / 16 : 1;
         int blocks_y = OP1::rows > 16 ? OP1::rows / 16 : 1;
         mat_mul_grad_left << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (parent_grad, op2.gpu_data, op1_grad, OP1::rows, OP1::cols, cols);
-        op1.eval_grad(op1_grad);
+        
         blocks_x = OP2::cols > 16 ? OP2::cols / 16 : 1;
         blocks_y = OP2::rows > 16 ? OP2::rows / 16 : 1;
         mat_mul_grad_right << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (parent_grad, op1.gpu_data, op2_grad, OP2::rows, OP2::cols, rows);
-        op2.eval_grad(op2_grad);
+        
+        if (++proccessed_parents == num_parents)
+		{
+			op1.eval_grad(op1_grad);
+			op2.eval_grad(op2_grad);
+		}
     }
 
-
+    size_t num_parents = 0;
+    size_t proccessed_parents = 0;
     OP1& op1;
     OP2& op2;
     float* gpu_data;
@@ -312,11 +378,15 @@ public:
     matrix_sum_all_cols(OP1& o1, OP2& o2) : op1(o1), op2(o2)
     {
         cudaMalloc(&gpu_data, rows * cols * sizeof(float));
+        cudaMalloc(&op1_grad, OP1::rows * OP1::cols * sizeof(float));
         cudaMalloc(&op2_grad, OP2::rows * OP2::cols * sizeof(float));
+        op1.num_parents++;
+        op2.num_parents++;
     };
     ~matrix_sum_all_cols()
     {
         cudaFree(&gpu_data);
+        cudaFree(&op1_grad);
         cudaFree(&op2_grad);
     }
     void eval()
@@ -327,15 +397,34 @@ public:
         int blocks_y = rows > 16 ? cols / 16 : 1;
         mat_sum_all_cols << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (op1.gpu_data, op2.gpu_data, gpu_data, rows, cols);
     }
+
+    void zero_grad()
+    {
+        proccessed_parents = 0;
+        cudaMemset(op1_grad, 0, OP1::rows * OP1::cols * sizeof(float));
+        cudaMemset(op2_grad, 0, OP2::rows * OP2::cols * sizeof(float));
+        op1.zero_grad();
+        op2.zero_grad();
+    }
+
     void eval_grad(float* parent_grad)
     {
         int blocks = rows > 16 ? rows / 16 : 1;
         mat_sum_all_cols_grad << < dim3(blocks, 1), dim3(1, 1) >> > (parent_grad, op2_grad, rows, cols);
-        op2.eval_grad(op2_grad);
-        op1.eval_grad(parent_grad);
+        int blocks_x = cols > 16 ? cols / 16 : 1;
+        int blocks_y = rows > 16 ? cols / 16 : 1;
+        mat_sum << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (op1_grad, parent_grad, op1_grad, rows, cols);
+        if (++proccessed_parents == num_parents)
+        {
+            op1.eval_grad(op1_grad);
+            op2.eval_grad(op2_grad);
+        }
     }
 
+    size_t num_parents = 0;
+    size_t proccessed_parents = 0;
     float* gpu_data;
+    float* op1_grad;
     float* op2_grad;
 private:
     OP1& op1;
@@ -354,10 +443,14 @@ public:
     matrix_sum(OP1& o1, OP2& o2) : op1(o1), op2(o2)
     {
         cudaMalloc(&gpu_data, rows * cols * sizeof(float));
+        cudaMalloc(&grad_data, rows * cols * sizeof(float));
+        op1.num_parents++;
+        op2.num_parents++;
     }
     ~matrix_sum()
     {
         cudaFree(&gpu_data);
+        cudaFree(&grad_data);
     }
 
     void eval()
@@ -369,16 +462,32 @@ public:
         mat_sum << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (op1.gpu_data, op2.gpu_data, gpu_data, rows, cols);
     }
 
-    void eval_grad(float* parent_grad)
+    void zero_grad()
     {
-        op1.eval_grad(parent_grad);
-        op2.eval_grad(parent_grad);
+        proccessed_parents = 0;
+        cudaMemset(grad_data, 0, rows * cols * sizeof(float));
+        op1.zero_grad();
+        op2.zero_grad();
     }
 
+    void eval_grad(float* parent_grad)
+    {
+        int blocks_x = cols > 16 ? cols / 16 : 1;
+        int blocks_y = rows > 16 ? cols / 16 : 1;
+		mat_sum << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (parent_grad, grad_data, grad_data, rows, cols);
+        if (++proccessed_parents == num_parents)
+		{
+			op1.eval_grad(grad_data);
+			op2.eval_grad(grad_data);
+		}
+    }
 
+    size_t num_parents = 0;
+    size_t proccessed_parents = 0;
     OP1& op1;
     OP2& op2;
     float* gpu_data;
+    float* grad_data;
 };
 
 //A matrix where data from the CPU can be loaded
@@ -410,6 +519,11 @@ public:
         dirty = false;
 	}
 
+    void zero_grad()
+    {
+
+    }
+
 	void eval_grad(float* parent_grad)
 	{
 		
@@ -421,6 +535,7 @@ public:
 		gpu_data = full_data + current_data_idx * rows * cols;
     }
 
+    size_t num_parents = 0;
 	float* gpu_data;
     float* full_data;
 	std::vector<float> data;
@@ -441,6 +556,7 @@ public:
     weight_matrix() : data(std::vector<float>(rows* cols, 0))
     {
         cudaMalloc(&gpu_data, rows * cols * sizeof(float));
+        cudaMalloc(&grad_data, rows * cols * sizeof(float));
         dirty = true;
     }
     ~weight_matrix()
@@ -460,9 +576,15 @@ public:
         dirty = false;
     }
 
+    void zero_grad()
+    {
+		cudaMemset(grad_data, 0, rows * cols * sizeof(float));
+    }
     void eval_grad(float* parent_grad)
     {
-        grad_data = parent_grad;
+        int blocks_x = cols > 16 ? cols / 16 : 1;
+        int blocks_y = rows > 16 ? cols / 16 : 1;
+        mat_sum << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (parent_grad, grad_data, grad_data, rows, cols);
     }
 
     void gradient_descent(float alpha)
@@ -472,6 +594,7 @@ public:
         mat_grad_desc << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (grad_data, gpu_data, alpha, rows, cols);
     }
 
+    size_t num_parents = 0;
     float* gpu_data;
     float* grad_data;
     std::vector<float> data;
@@ -490,14 +613,24 @@ void mlp_example()
     auto b2 = weight_matrix<1, 1>();
     
     //moon dataset
-    
+    auto device = std::random_device();
+    auto generator = std::mt19937(device());
+    auto distribution = std::uniform_real_distribution<float>(-1.0f, 1.0f);
+
     auto x = input_matrix<2, 2>(256);
+    auto v1 = std::vector<int>(128);
+    auto v2 = std::vector<int>(128);
+    std::iota(v1.begin(), v1.end(), 0);
+    std::iota(v2.begin(), v2.end(), 0);
+    std::shuffle(v1.begin(), v1.end(), generator);
+    std::shuffle(v2.begin(), v2.end(), generator);
+
     for (size_t i = 0; i < 128; i++)
 	{
-		x.data[i * 4] = 0.5f * cosf(3.1415f * i / 256.0f);
-		x.data[i * 4 + 2] = 0.5f * sinf(3.1415f * i / 256.0f);
-        x.data[i * 4 + 1] = 0.5f * cosf(3.1415f * i / 256.0f) + 0.5f;
-        x.data[i * 4 + 3] = -0.5f * sinf(3.1415f * i / 256.0f) + 0.3f;
+		x.data[i * 4] = 0.5f * cosf(3.1415f * v1[i] / 256.0f);
+		x.data[i * 4 + 2] = 0.5f * sinf(3.1415f * v1[i] / 256.0f);
+        x.data[i * 4 + 1] = 0.5f * cosf(3.1415f * v2[i] / 256.0f) + 0.5f;
+        x.data[i * 4 + 3] = -0.5f * sinf(3.1415f * v2[i] / 256.0f) + 0.3f;
 	}
     auto y = input_matrix<1, 2>(256);
     for (size_t i = 0; i < 256; i++)
@@ -514,11 +647,29 @@ void mlp_example()
     auto diff = matrix_sum(final_res, y);
     auto sqr = matrix_l2(diff);
 
-    //training
-    float lr = 0.6f;
-    
-    for (size_t i = 0; i < 1000; i++)
+    for (size_t i = 0; i < W1.cols * W1.rows; i++)
     {
+		W1.data[i] = distribution(generator);
+    }
+    for (size_t i = 0; i < W2.cols * W2.rows; i++)
+    {
+        W2.data[i] = distribution(generator);
+    }
+    for (size_t i = 0; i < b1.cols * b1.rows; i++)
+	{
+		b1.data[i] = distribution(generator);
+	}
+    for (size_t i = 0; i < b2.cols * b2.rows; i++)
+    {
+        b2.data[i] = distribution(generator);
+    }
+
+    //training
+    float lr = 0.06f;
+    
+    for (size_t i = 0; i < 10000; i++)
+    {
+        sqr.zero_grad();
         sqr.eval();
         sqr.eval_grad();
         
@@ -526,15 +677,10 @@ void mlp_example()
         W2.gradient_descent(lr);
         b1.gradient_descent(lr);
         b2.gradient_descent(lr);
+
         y.next_data();
         x.next_data();
-
-        lr -= 0.0005f;
-        if (lr < 0.001f)
-            lr = 0.001f;
     }
-    
-
 
 }
 
@@ -545,7 +691,16 @@ void matrix_inversion_example()
     auto y = input_matrix<matrix_size, matrix_size>(1);
     auto minus_eye = input_matrix<matrix_size, matrix_size>(1);
     
+    std::random_device device;
+    std::mt19937 generator(device());
+    std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+
     //fill matrices
+    for (size_t i = 0;i < matrix_size * matrix_size; i++)
+	{
+		y.data[i] = distribution(generator);
+	}
+
     for (size_t i = 0; i < matrix_size; i++)
     {
         y.data[i + ((i + 1) % matrix_size) * matrix_size] = 1.0f;
@@ -557,12 +712,14 @@ void matrix_inversion_example()
     //computes ||x*y - I||^2, which we'll minimize
     auto sqr = matrix_l2(sum);
     //do  gradient descent
-    for (size_t i = 0; i < 1000; i++)
+    for (size_t i = 0; i < 10000; i++)
     {
+        sqr.zero_grad();
         sqr.eval();
         sqr.eval_grad();
-        x.gradient_descent(0.02f);
+        x.gradient_descent(0.04f);
     }
+    
     //download result from gpu and print it
     x.download();
     for (size_t i = 0; i < matrix_size; i++)
@@ -574,6 +731,7 @@ void matrix_inversion_example()
         std::cout << '\n';
 
     }
+    
 }
 
 int main()
