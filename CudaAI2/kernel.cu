@@ -200,15 +200,9 @@ public:
         op1.eval();
         op2.eval();
 
-        //multiply op1 and op2 in cublas
         float alpha = 1.0f;
         float beta = 0.0f;
         cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, cols, rows, OP1::cols, &alpha, op2.gpu_data, cols, op1.gpu_data, OP1::cols, &beta, gpu_data, cols);
-
-        /*int blocks_x = cols > 16 ? cols / 16 : 1;
-        int blocks_y = rows > 16 ? cols / 16 : 1;
-        mat_mul << < dim3(blocks_x, blocks_y), dim3(16, 16) >> > (op1.gpu_data, op2.gpu_data, gpu_data, rows, OP1::cols, cols);
-        */
     }
 
     void zero_grad()
